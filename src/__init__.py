@@ -1,0 +1,1 @@
+"""Gym-equipment detector package."""

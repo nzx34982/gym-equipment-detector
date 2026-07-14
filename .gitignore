@@ -2,14 +2,19 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Virtual env
 .venv/
 venv/
 env/
+.env
 
-# PyCharm
+# IDE
 .idea/
+.vscode/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -21,9 +26,12 @@ Thumbs.db
 # Model checkpoints
 checkpoints/
 *.pth
+*.pt
+*.ckpt
 
 # Outputs
 outputs/
+artifacts/
 
 # Dataset
 images_flat/
@@ -32,3 +40,4 @@ annotations_voc/
 # Optional: large archives
 *.zip
 *.rar
+*.7z

@@ -1,90 +1,127 @@
-import os
+from __future__ import annotations
+
 import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Callable
 
+import numpy as np
 import torch
-from torch.utils.data import Dataset
 from PIL import Image
+from torch.utils.data import Dataset
 
 
-CLASS_NAME_TO_ID = {
-    "treadmill": 1,
-    "elliptical": 2,
-    "stair_climber": 3,
-    "big_scissor_machine": 4,
-    "single_arm_row_machine": 5,
-    "tbar_row_machine": 6,
-}
+CLASS_NAMES = (
+    "treadmill",
+    "elliptical",
+    "stair_climber",
+    "big_scissor_machine",
+    "single_arm_row_machine",
+    "tbar_row_machine",
+)
+CLASS_NAME_TO_ID = {name: index for index, name in enumerate(CLASS_NAMES, start=1)}
+ID_TO_CLASS_NAME = {class_id: name for name, class_id in CLASS_NAME_TO_ID.items()}
+NUM_CLASSES = len(CLASS_NAMES) + 1  # Six foreground classes plus background.
 
 
 class GymDetectionDataset(Dataset):
-    def __init__(self, images_dir, annotations_dir, split_file, transforms=None):
-        self.images_dir = images_dir
-        self.annotations_dir = annotations_dir
+    """A minimal Pascal VOC-style dataset for gym-equipment detection."""
+
+    def __init__(
+        self,
+        images_dir: str | Path,
+        annotations_dir: str | Path,
+        split_file: str | Path,
+        transforms: Callable | None = None,
+    ) -> None:
+        self.images_dir = Path(images_dir)
+        self.annotations_dir = Path(annotations_dir)
         self.transforms = transforms
 
-        with open(split_file, "r", encoding="utf-8") as f:
-            self.ids = [line.strip() for line in f if line.strip()]
+        split_path = Path(split_file)
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Split file does not exist: {split_path}")
+        self.ids = [
+            line.strip()
+            for line in split_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not self.ids:
+            raise ValueError(f"Split file contains no image identifiers: {split_path}")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.ids)
 
-    def __getitem__(self, idx):
+    def _image_path(self, image_id: str) -> Path:
+        for suffix in (".jpg", ".jpeg", ".png"):
+            candidate = self.images_dir / f"{image_id}{suffix}"
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(
+            f"No JPG/JPEG/PNG image found for identifier '{image_id}' in "
+            f"{self.images_dir}"
+        )
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         image_id = self.ids[idx]
+        image_path = self._image_path(image_id)
+        annotation_path = self.annotations_dir / f"{image_id}.xml"
+        if not annotation_path.is_file():
+            raise FileNotFoundError(f"Annotation does not exist: {annotation_path}")
 
-        img_path = os.path.join(self.images_dir, image_id + ".jpg")
-        xml_path = os.path.join(self.annotations_dir, image_id + ".xml")
-
-        image = Image.open(img_path).convert("RGB")
+        image = Image.open(image_path).convert("RGB")
         width, height = image.size
+        root = ET.parse(annotation_path).getroot()
 
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-
-        boxes = []
-        labels = []
-
+        boxes: list[list[float]] = []
+        labels: list[int] = []
         for obj in root.findall("object"):
-            class_name = obj.find("name").text.strip()
+            name_node = obj.find("name")
+            if name_node is None or not name_node.text:
+                raise ValueError(f"Object without class name in {annotation_path}")
+            class_name = name_node.text.strip()
             if class_name not in CLASS_NAME_TO_ID:
-                continue
+                raise ValueError(
+                    f"Unknown class '{class_name}' in {annotation_path}; "
+                    f"expected one of {CLASS_NAMES}"
+                )
 
-            bndbox = obj.find("bndbox")
-            xmin = float(bndbox.find("xmin").text)
-            ymin = float(bndbox.find("ymin").text)
-            xmax = float(bndbox.find("xmax").text)
-            ymax = float(bndbox.find("ymax").text)
+            box_node = obj.find("bndbox")
+            if box_node is None:
+                raise ValueError(f"Object without bndbox in {annotation_path}")
+            try:
+                xmin = float(box_node.findtext("xmin", ""))
+                ymin = float(box_node.findtext("ymin", ""))
+                xmax = float(box_node.findtext("xmax", ""))
+                ymax = float(box_node.findtext("ymax", ""))
+            except ValueError as exc:
+                raise ValueError(f"Invalid bndbox values in {annotation_path}") from exc
 
-            # 简单防御，避免脏标注
-            xmin = max(0, min(xmin, width - 1))
-            ymin = max(0, min(ymin, height - 1))
-            xmax = max(0, min(xmax, width - 1))
-            ymax = max(0, min(ymax, height - 1))
-
+            xmin = max(0.0, min(xmin, width - 1.0))
+            ymin = max(0.0, min(ymin, height - 1.0))
+            xmax = max(0.0, min(xmax, width - 1.0))
+            ymax = max(0.0, min(ymax, height - 1.0))
             if xmax <= xmin or ymax <= ymin:
                 continue
 
             boxes.append([xmin, ymin, xmax, ymax])
             labels.append(CLASS_NAME_TO_ID[class_name])
 
-        boxes = torch.tensor(boxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.int64)
-
-        area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) if len(boxes) > 0 else torch.tensor([], dtype=torch.float32)
-        iscrowd = torch.zeros((len(labels),), dtype=torch.int64)
-
+        boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
+        area = (
+            (boxes_tensor[:, 2] - boxes_tensor[:, 0])
+            * (boxes_tensor[:, 3] - boxes_tensor[:, 1])
+        )
         target = {
-            "boxes": boxes,
-            "labels": labels,
-            "image_id": torch.tensor([idx]),
+            "boxes": boxes_tensor,
+            "labels": labels_tensor,
+            "image_id": torch.tensor([idx], dtype=torch.int64),
             "area": area,
-            "iscrowd": iscrowd,
+            "iscrowd": torch.zeros((len(labels_tensor),), dtype=torch.int64),
         }
 
-        image = torch.from_numpy(
-            __import__("numpy").array(image)
-        ).permute(2, 0, 1).float() / 255.0
-
+        image_tensor = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1)
+        image_tensor = image_tensor.float() / 255.0
         if self.transforms is not None:
-            image = self.transforms(image)
-
-        return image, target
+            image_tensor = self.transforms(image_tensor)
+        return image_tensor, target

@@ -1,94 +1,93 @@
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 
-import torch
 import numpy as np
+import torch
 from PIL import Image, ImageDraw
-from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_320_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+from .dataset_voc import ID_TO_CLASS_NAME
+from .modeling import load_model_for_inference
 
 
-CLASS_NAME_TO_ID = {
-    "treadmill": 1,
-    "elliptical": 2,
-    "stair_climber": 3,
-    "big_scissor_machine": 4,
-    "single_arm_row_machine": 5,
-    "tbar_row_machine": 6,
-}
-
-ID_TO_CLASS_NAME = {v: k for k, v in CLASS_NAME_TO_ID.items()}
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def get_model(num_classes):
-    model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=None)
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    return model
-
-
-def main():
-    project_root = Path(__file__).resolve().parent.parent
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 读取验证集第一张图片名
-    val_txt = project_root / "splits" / "train.txt"
-    with open(val_txt, "r", encoding="utf-8") as f:
-        image_id = f.readline().strip()
-
-    image_path = project_root / "images_flat" / f"{image_id}.jpg"
-    save_dir = project_root / "outputs"
-    save_dir.mkdir(exist_ok=True)
-    save_path = save_dir / f"{image_id}_pred.jpg"
-
-    # 加载模型
-    model = get_model(num_classes=7)
-    ckpt_path = project_root / "checkpoints" / "gym_detector_v1.pth"
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    model.to(device)
-    model.eval()
-
-    # 读取图片
+def predict_and_draw(
+    model,
+    image_path: Path,
+    output_path: Path,
+    device: torch.device,
+    score_threshold: float = 0.3,
+    max_boxes: int | None = None,
+) -> dict[str, float | int]:
     image = Image.open(image_path).convert("RGB")
-    image_np = np.array(image)
-    image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
-    image_tensor = image_tensor.to(device)
+    width, height = image.size
+    image_tensor = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1)
+    image_tensor = image_tensor.float().div(255).to(device)
 
-    # 推理
     with torch.no_grad():
         output = model([image_tensor])[0]
-
     boxes = output["boxes"].cpu().numpy()
     labels = output["labels"].cpu().numpy()
     scores = output["scores"].cpu().numpy()
 
-    # 画框
     draw = ImageDraw.Draw(image)
-    score_threshold = 0.2
-
-    count = 0
+    kept = 0
+    best_score = 0.0
     for box, label, score in zip(boxes, labels, scores):
         if score < score_threshold:
             continue
-
+        if max_boxes is not None and kept >= max_boxes:
+            break
         xmin, ymin, xmax, ymax = box
+        xmin = max(0.0, min(float(xmin), width - 1.0))
+        ymin = max(0.0, min(float(ymin), height - 1.0))
+        xmax = max(0.0, min(float(xmax), width - 1.0))
+        ymax = max(0.0, min(float(ymax), height - 1.0))
+        if xmax <= xmin or ymax <= ymin:
+            continue
+
         class_name = ID_TO_CLASS_NAME.get(int(label), "unknown")
-        text = f"{class_name} {score:.2f}"
-
         draw.rectangle([xmin, ymin, xmax, ymax], outline="red", width=4)
-        draw.text((xmin, max(ymin - 20, 0)), text, fill="red")
-        count += 1
+        draw.text((xmin, max(ymin - 20, 0)), f"{class_name} {score:.2f}", fill="red")
+        kept += 1
+        best_score = max(best_score, float(score))
 
-    image.save(save_path)
-    print("前10个原始预测：")
-    for i in range(min(10, len(scores))):
-        cls_id = int(labels[i])
-        cls_name = ID_TO_CLASS_NAME.get(cls_id, "unknown")
-        print(f"{i}: class={cls_name}, score={scores[i]:.4f}, box={boxes[i]}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path)
+    return {"kept_boxes": kept, "best_score": best_score}
 
-    print("device:", device)
-    print("image_id:", image_id)
-    print("预测框数量(阈值过滤后):", count)
-    print("结果已保存到:", save_path)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run inference on one image.")
+    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "gym_detector_v1.pth"
+    )
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs" / "prediction.jpg")
+    parser.add_argument("--score-threshold", type=float, default=0.3)
+    parser.add_argument("--max-boxes", type=int, default=3)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model_for_inference(args.checkpoint, device)
+    summary = predict_and_draw(
+        model=model,
+        image_path=args.image,
+        output_path=args.output,
+        device=device,
+        score_threshold=args.score_threshold,
+        max_boxes=args.max_boxes,
+    )
+    print(f"Device: {device}")
+    print(f"Kept boxes: {summary['kept_boxes']}")
+    print(f"Best score: {summary['best_score']:.4f}")
+    print(f"Output: {args.output}")
 
 
 if __name__ == "__main__":
